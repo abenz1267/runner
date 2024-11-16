@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync"
 
 	"github.com/spf13/viper"
 )
@@ -21,11 +22,11 @@ type Provider interface {
 var providers map[string]Provider
 
 type Item struct {
-	Labels     []string
+	Labels     map[string]string
 	Icon       string
 	Identifier string
 	Provider   string
-	score      int
+	score      float64
 }
 
 type QueryRequest struct {
@@ -56,8 +57,12 @@ var (
 
 func main() {
 	readConfig()
+	setTerminal()
 
 	providers = make(map[string]Provider)
+
+	providers["applications"] = &Applications{}
+	providers["applications"].Setup()
 
 	listen(filepath.Join(tmpDir(), socket))
 }
@@ -80,10 +85,6 @@ func readConfig() {
 	if err != nil {
 		panic(err)
 	}
-
-	setTerminal()
-
-	fmt.Println(viper.AllSettings())
 }
 
 func setTerminal() {
@@ -149,10 +150,7 @@ func setTerminal() {
 func listen(sock string) {
 	slog.Info("start listening...")
 
-	err := os.Remove(sock)
-	if err != nil {
-		panic(err)
-	}
+	_ = os.Remove(sock)
 
 	l, err := net.ListenUnix("unix", &net.UnixAddr{Name: sock})
 	if err != nil {
@@ -196,20 +194,25 @@ func handleConnection(conn net.Conn) {
 
 			return
 		} else {
-			query(req)
+			items := query(req)
+
+			resp, err := json.Marshal(items)
+			if err != nil {
+				slog.Error("error marshalling response", "error", err.Error())
+				return
+			}
+
+			_, err = conn.Write(resp)
+			if err != nil {
+				slog.Error("error writing response", "error", err.Error())
+				return
+			}
 		}
 	case activationRequestIdentifier:
 		slog.Info("activation received")
 	default:
 		slog.Info("unknown command received")
 
-		return
-	}
-
-	// response
-	_, err = conn.Write(buf[:n])
-	if err != nil {
-		slog.Error("error writing response", "error", err.Error())
 		return
 	}
 
@@ -238,9 +241,38 @@ func parseQueryRequest(buf []byte) (QueryRequest, error) {
 	return request, nil
 }
 
-func query(req QueryRequest) {
+func query(req QueryRequest) []Item {
 	slog.Info("processing query")
-	fmt.Println(req)
+
+	result := []Item{}
+
+	var mutex sync.Mutex
+
+	var wg sync.WaitGroup
+
+	for _, v := range req.Providers {
+		if val, ok := providers[v]; ok {
+			wg.Add(1)
+
+			go func(p Provider, mut *sync.Mutex, wg *sync.WaitGroup) {
+				defer wg.Done()
+
+				items := p.Query(req.Query)
+
+				mut.Lock()
+				result = append(result, items...)
+				mut.Unlock()
+			}(
+				val,
+				&mutex,
+				&wg,
+			)
+		}
+	}
+
+	wg.Wait()
+
+	return result
 }
 
 func activate(req ActivationRequest) {
